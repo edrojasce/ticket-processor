@@ -14,8 +14,7 @@ class AIExpenseTracker:
         
         Args:
             model: Modelo de Ollama a usar
-                   - llama3.2-vision:11b (mejor calidad, más lento, 16GB RAM)
-                   - 'llama3:latest' 
+                   - 'llama3.2-vision:11b' (mejor calidad, más lento, 16GB RAM)
                    - 'llama3.2-vision:90b' (máxima calidad, muy lento, 64GB RAM)
                    - 'llava:7b' (más rápido, menos RAM, 8GB RAM)
                    - 'llava:13b' (balance, 16GB RAM)
@@ -56,6 +55,15 @@ class AIExpenseTracker:
                     raise Exception(f"Modelo {self.model} no disponible")
                 else:
                     print(f"[+] Ollama conectado - Modelo: {self.model}")
+                    
+                    # Verificar si el modelo está cargado en memoria
+                    print("[*] Verificando recursos del sistema...")
+                    ps_response = requests.get(f"{self.ollama_url}/api/ps", timeout=5)
+                    if ps_response.status_code == 200:
+                        running = ps_response.json().get('models', [])
+                        if not any(self.model in m.get('name', '') for m in running):
+                            print(f"[*] Modelo no cargado en memoria - primera imagen sera lenta")
+                    
             else:
                 raise Exception("Ollama no responde correctamente")
         except requests.exceptions.ConnectionError:
@@ -68,20 +76,29 @@ class AIExpenseTracker:
     def image_to_base64(self, image_path):
         """Convierte imagen a base64 para enviar a Ollama"""
         try:
-            # Abrir y redimensionar si es muy grande
+            # Abrir imagen
             img = Image.open(image_path)
             
-            # Redimensionar para acelerar procesamiento (max 2000px)
-            max_size = 2000
+            # Convertir a RGB si es necesario
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            
+            # OPTIMIZACIÓN: Redimensionar agresivamente para acelerar
+            # Tickets no necesitan alta resolución para OCR
+            max_size = 1200  # Reducido de 2000 a 1200
             if max(img.size) > max_size:
                 ratio = max_size / max(img.size)
                 new_size = tuple(int(dim * ratio) for dim in img.size)
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
             
-            # Convertir a base64
+            # Convertir a JPEG con compresión para reducir tamaño
             buffered = io.BytesIO()
-            img.save(buffered, format=img.format or 'JPEG')
+            img.save(buffered, format='JPEG', quality=85, optimize=True)
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            # Mostrar tamaño para debug
+            size_kb = len(img_base64) / 1024
+            print(f"  [*] Imagen: {img.size[0]}x{img.size[1]}px, {size_kb:.1f}KB")
             
             return img_base64
         except Exception as e:
@@ -97,44 +114,63 @@ class AIExpenseTracker:
         if not img_base64:
             return self._create_error_result(image_path.name, "Error al leer imagen")
         
-        # Prompt para el modelo
-        prompt = """Analiza este ticket/recibo de compra y extrae la siguiente información.
-Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes o después. Este es un ejemplo de la estructura esperada:
+        # Prompt mejorado y más específico
+        prompt = """Eres un experto en leer tickets/recibos. Analiza CUIDADOSAMENTE esta imagen y extrae la información exacta.
 
+INSTRUCCIONES CRÍTICAS:
+1. Lee TODO el texto visible en el ticket
+2. Busca la palabra "TOTAL" (puede estar como "Total:", "TOTAL:", "Total a Pagar", etc.)
+3. El monto SIEMPRE está cerca de la palabra "TOTAL" - busca el número más grande después de "TOTAL"
+4. La fecha suele estar en formato DD/MM/YYYY o MM/DD/YYYY - conviértela a YYYY-MM-DD
+5. Los últimos 4 dígitos de tarjeta aparecen como: "****1234", "xxxx 1234", o cerca de "CARD", "VISA", "DEBIT"
+6. Lee el nombre del comercio que está en la PARTE SUPERIOR del ticket
+
+RESPONDE SOLO CON ESTE JSON (sin texto adicional):
 {
-  "comercio": "nombre del establecimiento",
-  "fecha": "YYYY-MM-DD (formato estricto, si encuentras DD/MM/YYYY conviértelo)",
+  "comercio": "nombre exacto del establecimiento en la parte superior",
+  "fecha": "YYYY-MM-DD",
   "hora": "HH:MM",
   "monto": 123.45,
-  "metodo_pago": "últimos 4 dígitos de tarjeta (ej: ****1234) o 'Efectivo' o tipo de tarjeta",
-  "categoria": "una de estas: Alimentos, Transporte, Entretenimiento, Salud, Servicios, Ropa, Tecnologia, Otros"
+  "metodo_pago": "****1234 o Efectivo o Visa",
+  "categoria": "Alimentos, Transporte, Entretenimiento, Salud, Servicios, Ropa, Tecnologia, u Otros"
 }
 
-Reglas importantes:
-- Si no encuentras un dato, usa null
-- El monto debe ser un número decimal (ej: 123.45, no "$123.45")
-- La fecha debe estar en formato YYYY-MM-DD
-- Para método de pago: si ves asteriscos seguidos de 4 dígitos, usa ****XXXX
-- La categoría debe ser exactamente una de las listadas
-- Busca el TOTAL final, no subtotales
-- NO incluyas explicaciones, SOLO el JSON"""
+EJEMPLOS DE LO QUE BUSCAS:
+- Comercio: "Walmart", "OXXO", "Starbucks" (parte superior del ticket)
+- Fecha: Si ves "21/09/2020" → "2020-09-21"
+- Hora: Si ves "17:06:36" → "17:06"
+- Monto: Si ves "TOTAL    46.42" → 46.42 (el número después de TOTAL)
+- Pago: Si ves "**** **** **** 5870" → "****5870"
+- Categoria: Walmart = Alimentos, Restaurant = Alimentos, Gas = Transporte
+
+USA NULL SI NO ENCUENTRAS EL DATO. NO INVENTES INFORMACIÓN."""
 
         try:
-            # Llamar a Ollama API
+            # Llamar a Ollama API con configuraciones optimizadas
             payload = {
                 "model": self.model,
                 "prompt": prompt,
                 "images": [img_base64],
                 "stream": False,
-                "format": "json"  # Forzar respuesta en JSON
+                "format": "json",
+                "options": {
+                    "temperature": 0.1,  # Más determinístico
+                    "num_predict": 300,  # Limitar tokens de respuesta
+                    "num_ctx": 2048,     # Reducir contexto para velocidad
+                }
             }
             
-            print(f"  [*] Analizando con IA (esto puede tomar 10-30 segundos)...")
+            print(f"  [*] Enviando a IA...")
+            start_time = datetime.now()
+            
             response = requests.post(
                 self.api_endpoint,
                 json=payload,
-                timeout=120  # 2 minutos timeout
+                timeout=360  # 5 minutos
             )
+            
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"  [*] Respuesta recibida en {elapsed:.1f} segundos")
             
             if response.status_code != 200:
                 print(f"  [!] Error en API: {response.status_code}")
@@ -155,9 +191,9 @@ Reglas importantes:
             try:
                 data = json.loads(ai_response)
             except json.JSONDecodeError:
-                print(f"  [!] Respuesta no es JSON válido")
-                print(f"  [!] Respuesta recibida: {ai_response[:200]}")
-                return self._create_error_result(image_path.name, "Respuesta inválida de IA")
+                print(f"  [!] Respuesta no es JSON valido")
+                print(f"  [!] Respuesta: {ai_response[:200]}")
+                return self._create_error_result(image_path.name, "Respuesta invalida de IA")
             
             # Validar y limpiar datos
             expense = {
@@ -358,11 +394,12 @@ def main():
     
     # Configuración
     # Puedes cambiar el modelo aquí según tu hardware:
-    # - 'llama3:latest' (recomendado, 16GB RAM)
+    # - 'llama3.2-vision:11b' (recomendado, 16GB RAM)
     # - 'llava:7b' (más rápido, 8GB RAM)
     # - 'llava:13b' (balance, 16GB RAM)
     
     model = 'llava:7b'
+    
     try:
         tracker = AIExpenseTracker(model=model)
         folder_path = './data'
