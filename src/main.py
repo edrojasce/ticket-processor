@@ -343,10 +343,10 @@ class ExpenseTracker:
         try:
             wb = Workbook()
             ws = wb.active
-            ws.title = "Gastos con Imágenes"
+            ws.title = "Gastos con Imagenes"
             
             # Headers
-            headers = ['Imagen', 'Comercio', 'Fecha', 'Hora', 'Monto', 'Método Pago', 'Categoría', 'Archivo']
+            headers = ['Imagen', 'Comercio', 'Fecha', 'Hora', 'Monto', 'Metodo Pago', 'Categoria', 'Archivo']
             ws.append(headers)
             
             # Estilo de headers
@@ -371,16 +371,19 @@ class ExpenseTracker:
             # Procesar cada fila
             image_folder_path = Path(image_folder)
             row_idx = 2  # Empezar después del header
+            temp_files = []  # Para limpiar después
+            
+            print("[*] Generando Excel con imagenes...")
             
             for idx, row in df.iterrows():
                 # Insertar datos
-                ws.cell(row=row_idx, column=2, value=row['comercio'])
-                ws.cell(row=row_idx, column=3, value=row['fecha'])
-                ws.cell(row=row_idx, column=4, value=row['hora'])
+                ws.cell(row=row_idx, column=2, value=str(row['comercio']))
+                ws.cell(row=row_idx, column=3, value=str(row['fecha']) if pd.notna(row['fecha']) else "")
+                ws.cell(row=row_idx, column=4, value=str(row['hora']) if pd.notna(row['hora']) else "")
                 ws.cell(row=row_idx, column=5, value=f"${row['monto']:,.2f}" if pd.notna(row['monto']) else "N/A")
-                ws.cell(row=row_idx, column=6, value=row['metodo_pago'])
-                ws.cell(row=row_idx, column=7, value=row['categoria'])
-                ws.cell(row=row_idx, column=8, value=row['archivo'])
+                ws.cell(row=row_idx, column=6, value=str(row['metodo_pago']) if pd.notna(row['metodo_pago']) else "")
+                ws.cell(row=row_idx, column=7, value=str(row['categoria']))
+                ws.cell(row=row_idx, column=8, value=str(row['archivo']))
                 
                 # Centrar texto
                 for col in range(2, 9):
@@ -390,18 +393,23 @@ class ExpenseTracker:
                 image_path = image_folder_path / row['archivo']
                 if image_path.exists():
                     try:
-                        # Crear thumbnail de la imagen
+                        # Abrir y redimensionar imagen
                         img = Image.open(image_path)
+                        
+                        # Convertir a RGB si es necesario
+                        if img.mode in ('RGBA', 'P', 'LA'):
+                            img = img.convert('RGB')
                         
                         # Redimensionar para que quepa bien en Excel
                         max_height = 200
                         ratio = max_height / img.height
-                        new_size = (int(img.width * ratio), max_height)
-                        img.thumbnail(new_size, Image.Resampling.LANCZOS)
+                        new_width = int(img.width * ratio)
+                        img = img.resize((new_width, max_height), Image.Resampling.LANCZOS)
                         
-                        # Guardar thumbnail temporal
-                        temp_path = Path(f"temp_thumb_{idx}.jpg")
-                        img.save(temp_path, "JPEG")
+                        # Guardar thumbnail temporal con nombre único
+                        temp_path = Path(f"temp_excel_thumb_{row_idx}_{idx}.jpg")
+                        img.save(temp_path, "JPEG", quality=85)
+                        temp_files.append(temp_path)
                         
                         # Insertar en Excel
                         xl_img = XLImage(str(temp_path))
@@ -411,23 +419,33 @@ class ExpenseTracker:
                         # Ajustar altura de fila
                         ws.row_dimensions[row_idx].height = 150
                         
-                        # Limpiar temporal
-                        temp_path.unlink()
-                        
                     except Exception as e:
                         print(f"  [!] Error al insertar imagen {row['archivo']}: {e}")
-                        ws.cell(row=row_idx, column=1, value="Error cargando imagen")
+                        ws.cell(row=row_idx, column=1, value="Error al cargar")
                 else:
-                    ws.cell(row=row_idx, column=1, value="Imagen no encontrada")
+                    ws.cell(row=row_idx, column=1, value="No encontrada")
                 
                 row_idx += 1
             
             # Guardar Excel
+            print("[*] Guardando archivo Excel...")
             wb.save(excel_file)
+            
+            # Limpiar archivos temporales
+            print("[*] Limpiando archivos temporales...")
+            for temp_file in temp_files:
+                try:
+                    if temp_file.exists():
+                        temp_file.unlink()
+                except Exception as e:
+                    print(f"  [!] No se pudo eliminar temporal {temp_file}: {e}")
+            
             print(f"[+] Excel generado exitosamente con {len(df)} tickets")
             
         except Exception as e:
             print(f"[!] Error al generar Excel: {e}")
+            import traceback
+            traceback.print_exc()
     
     def analyze_receipt(self, image_path):
         """Analiza un ticket completo"""
@@ -504,8 +522,8 @@ class ExpenseTracker:
         
         return pd.DataFrame(expenses)
     
-    def generate_report(self, df, output_file='expenses_report.csv'):
-        """Genera reporte con estadísticas"""
+    def generate_report(self, df, output_file='expenses_report.csv', image_folder=None):
+        """Genera reporte con estadísticas y opcionalmente Excel con imágenes"""
         if df is None or df.empty:
             print("No hay datos para generar reporte")
             return
@@ -513,7 +531,14 @@ class ExpenseTracker:
         # Guardar CSV
         df.to_csv(output_file, index=False, encoding='utf-8-sig')
         print(f"\n{'='*60}")
-        print(f"[+] Reporte guardado en: {output_file}")
+        print(f"[+] Reporte CSV guardado en: {output_file}")
+        
+        # Si se proporciona carpeta de imágenes, generar Excel con imágenes
+        if image_folder and EXCEL_AVAILABLE:
+            excel_with_images = output_file.replace('.csv', '_con_imagenes.xlsx')
+            self._generate_excel_with_images(df, excel_with_images, image_folder)
+            print(f"[+] Excel con imagenes guardado en: {excel_with_images}")
+        
         print(f"{'='*60}")
         
         # Estadísticas
@@ -578,7 +603,7 @@ def main():
     # Generar reporte
     if df is not None:
         output_file = 'expenses_report.csv'
-        tracker.generate_report(df, output_file, folder_path)
+        tracker.generate_report(df, output_file=output_file, image_folder=folder_path)
         
         print("\n" + "="*60)
         print("PROCESO COMPLETADO")
